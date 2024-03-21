@@ -1,0 +1,196 @@
+---
+- name: Install and Configure Jenkins and Terraform
+  hosts: localhost
+  become: yes
+  vars:
+    jenkins_home: "/var/lib/jenkins"
+    jenkins_config_path : "{{ jenkins_home }}/casc_configs"
+    initial_admin_password_file: "{{ jenkins_home }}/secrets/initialAdminPassword"
+    jenkins_cli_jar: "/var/cache/jenkins/war/WEB-INF/jenkins-cli.jar"
+    jenkins_url: "http://localhost:8080/"
+    jenkins_plugins:
+      - git
+      - job-dsl
+      - blueocean
+      - configuration-as-code
+      - ec2
+      - script-security
+      - ssh-slaves
+      - credentials
+      - workflow-aggregator
+      - gitlab-plugin
+      - github
+      - docker-workflow
+      - nodejs
+      - matrix-auth
+      - terraform
+      - ansible
+      - pipeline-stage-view
+    terraform_version: "1.7.4"
+    terraform_install_path: "/usr/local/bin"
+
+  tasks:
+    - name: Stop Jenkins service before making changes
+      ansible.builtin.systemd:
+        name: jenkins
+        state: stopped
+        enabled: yes
+
+    - name: Jenkins Skip startUp for MI
+      lineinfile:
+        dest: /usr/lib/systemd/system/jenkins.service
+        regexp: '^Environment="JAVA_OPTS=-Djava.awt.headless=true'
+        line: 'Environment="JAVA_OPTS=-Djava.awt.headless=true -Djenkins.install.runSetupWizard=false -Djenkins.model.Jenkins.slaveAgentPort=50000"'
+      register: result_skip_startup_wizard
+
+    - name: Reload systemd daemon
+      ansible.builtin.command:
+        cmd: systemctl daemon-reload
+      become: yes
+
+    - name: Start Jenkins service
+      ansible.builtin.systemd:
+        name: jenkins
+        state: started
+        enabled: yes
+
+    - name: Wait for Jenkins to be fully started
+      ansible.builtin.uri:
+        url: http://localhost:8080/login
+        method: GET
+        status_code: [ 200, 403 ]  # Jenkins might return 403 Forbidden if not logged in, which is still a sign of it running
+        timeout: 10
+      register: jenkins_response
+      until: jenkins_response.status == 200 or jenkins_response.status == 403
+      retries: 30
+      delay: 10
+
+    - name: Wait for Jenkins initial setup to complete
+      ansible.builtin.wait_for:
+        path: "{{ initial_admin_password_file }}"
+        state: present
+        timeout: 60
+
+    # From here, we need the initial admin password for Jenkins CLI operations
+    - name: Retrieve Jenkins initial admin password
+      ansible.builtin.slurp:
+        src: "{{ initial_admin_password_file }}"
+      register: initial_admin_password_result
+      tags:
+        - add-credentials
+
+    - name: Set Jenkins initial admin password variable
+      set_fact:
+        initial_admin_password: "{{ initial_admin_password_result['content'] | b64decode }}"
+      tags:
+        - add-credentials
+
+    - name: Download Jenkins CLI jar
+      get_url:
+        url: "http://localhost:8080/jnlpJars/jenkins-cli.jar"
+        dest: "/tmp/jenkins-cli.jar"
+        mode: '0755'
+      become: yes
+
+    # Example: Install a Jenkins plugin using the CLI and the initial admin password
+    - name: Install Jenkins plugins via CLI
+      command: >
+        java -jar /tmp/jenkins-cli.jar -s {{ jenkins_url }} -auth admin:{{ initial_admin_password }} install-plugin {{ item }} -deploy
+      loop: "{{ jenkins_plugins }}"
+
+    - name: Restart Jenkins to load the new plugins
+      ansible.builtin.systemd:
+        name: jenkins
+        state: restarted
+
+    - name: Install unzip (required for Terraform installation)
+      dnf:
+        name: unzip
+        state: present
+
+    - name: install aws cli
+      ansible.builtin.get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /home/ec2-user/awscliv2.zip
+
+    - name: unzip zip file
+      ansible.builtin.unarchive:
+        src: /home/ec2-user/awscliv2.zip
+        dest: /home/ec2-user
+        remote_src: True
+
+    - name: run the installer
+      ansible.builtin.command:
+      args:
+        cmd: "./aws/install"
+        creates: /usr/local/bin/aws
+
+    - name: Store Jenkins admin username in SSM
+      community.aws.ssm_parameter:
+        name: "/jenkins/credentials/username"
+        value: "admin"
+        region: eu-north-1
+        type: String
+        overwrite_value: changed
+        state: present
+
+    - name: Store Jenkins initial admin password in SSM
+      community.aws.ssm_parameter:
+        name: "/jenkins/credentials/password"
+        value: "{{ initial_admin_password }}"
+        region: eu-north-1
+        type: SecureString
+        overwrite_value: changed
+        state: present
+
+    - name: Download Terraform
+      get_url:
+        url: "https://releases.hashicorp.com/terraform/{{ terraform_version }}/terraform_{{ terraform_version }}_linux_amd64.zip"
+        dest: "/tmp/terraform.zip"
+        mode: '0644'
+
+    - name: Unzip Terraform
+      ansible.builtin.unarchive:
+        src: "/tmp/terraform.zip"
+        dest: "{{ terraform_install_path }}"
+        remote_src: yes
+        creates: "{{ terraform_install_path }}/terraform"
+
+    - name: Ensure Terraform binary is executable
+      file:
+        path: "{{ terraform_install_path }}/terraform"
+        mode: '0755'
+
+    - name: Load private key content
+      ansible.builtin.set_fact:
+        private_key_content: "{{ lookup('file', 'jenkins-key.pem') | trim }}"
+      tags:
+        - add-credentials
+
+    - name: Render the Jenkins SSH credential XML from template
+      ansible.builtin.template:
+        src: jenkins-ssh-credential.xml.j2
+        dest: /tmp/jenkins-ssh-credential.xml
+      delegate_to: localhost
+      tags:
+        - add-credentials
+
+    - name: Copy the rendered XML to Jenkins server
+      ansible.builtin.copy:
+        src: /tmp/jenkins-ssh-credential.xml
+        dest: /tmp/jenkins-ssh-credential.xml
+      tags:
+        - add-credentials
+
+    - name: Create Jenkins SSH credentials via Jenkins CLI
+      ansible.builtin.command:
+        cmd: "java -jar /tmp/jenkins-cli.jar -s {{ jenkins_url }} -auth admin:{{ initial_admin_password | trim }} create-credentials-by-xml system::system::jenkins _"
+        stdin: "{{ lookup('file', '/tmp/jenkins-ssh-credential.xml') }}"
+      tags:
+        - add-credentials
+
+  handlers:
+    - name: Restart Jenkins
+      service:
+        name: jenkins
+        state: restarted
